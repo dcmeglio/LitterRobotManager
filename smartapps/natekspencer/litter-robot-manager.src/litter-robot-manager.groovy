@@ -21,6 +21,8 @@
  *  1.0.3       2020-05-15      Adjust LR selection dropdown to support > 1 device. 
  */
 
+ import groovy.transform.Field
+
 definition(
     name: "Litter-Robot Manager",
     namespace: "natekspencer",
@@ -39,17 +41,13 @@ preferences {
     page(name: "authResultPage")
 }
 
-def mainPage() {
-	state.apiKey = "Gmdfw5Cq3F3Mk6xvvO0inHATJeoDv6C3KfwfOuh0"
-    // Check for API key
-    if (!state.apiKey?.trim()) {
-        dynamicPage(name: "mainPage", install: false) {
-            section("API Key Missing") {
-				
-                paragraph("No API Key was found. Please go to the App Settings and enter your API Key.")
-            }
-        }
-    } else {
+@Field static def authHost = "https://autopets.sso.iothings.site"
+@Field static def apiHost = "https://v2.api.whisker.iothings.site"
+@Field static def clientId = "IYXzWN908psOm7sNpe4G.ios.whisker.robots"
+@Field static def clientSecret = "C63CLXOmwNaqLTB2xXo6QIWGwwBamcPuaul"
+@Field static def xApiKey = "p7ndMoj61npRZP5CVz9v4Uj0bG769xy6758QRBPb"
+
+def mainPage() {           
         def robots = [:]
         // Get robots if we don't have them already
         if ((state.robots?.size()?:0) == 0 && state.token?.trim()) {
@@ -76,7 +74,6 @@ def mainPage() {
                 label name: "name", title: "Assign a name", required: false, defaultValue: app.name, description: app.name, submitOnChange: true
             }
         }
-    }
 }
 
 def authPage() {
@@ -92,7 +89,6 @@ def authResultPage() {
     log.info "Attempting login with specified credentials..."
     
     doLogin()
-    log.info state.loginResponse
     
     // Check if login was successful
     if (state.token == null) {
@@ -102,6 +98,8 @@ def authResultPage() {
             }
         }
     } else {
+        if (state.userId == null)
+            getUserId()
         dynamicPage(name: "authResultPage", nextPage: "mainPage", uninstall: false, install: false) {
             section("${state.loginResponse}") {
                 paragraph ("Please click next to continue setting up your Litter-Robot.")
@@ -112,60 +110,57 @@ def authResultPage() {
 
 boolean doLogin(){
     def loggedIn = false
-    def resp = doCallout("POST", "/login", [email: email, password: password, oneSignalPlayerId: "0"])
+    def resp = authApi(email,password)
     state.loginAttempt = (state.loginAttempt ?: 0) + 1
     
     switch (resp.status) {
         case 403:
             state.loggedIn = false
             state.loginResponse = resp.data.message == "Forbidden" ? "Access forbidden: invalid API key" : resp.data.message
-            state.uri = null
+            state.refresh_token = null
             state.token = null
             state.robots = null
+            state.token_expiration = null
             break
         case 401:
             state.loggedIn = false
-            state.loginResponse = resp.data.userMessage
-            state.uri = null
+            state.loginResponse = "Login unsuccessful"
+            state.refresh_token = null
             state.token = null
             state.robots = null
+            state.token_expiration = null
             break
         case 200:
+            state.loginResponse = "Login successful"
             state.loggedIn = true
-            state.loginResponse = resp.data._developerMessage
-            state.uri = resp.data._uri
-            state.token = resp.data.token
-            state.loginDate = toStDateString(parseLrDate(resp.data._created))
+            state.token = resp.data.access_token
+            state.refresh_token = resp.data.refresh_toke
+            state.token_expiration = now() + (resp.data.expires_in*1000)-10000
             state.remove("loginAttempt")
             break
         default:
-            log.debug resp.data
             state.loggedIn = false
             state.loginResponse = "Login unsuccessful"
-            state.uri = null
+            state.refresh_token = null
             state.token = null
             state.robots = null
+            state.token_expiration = null
             break
     }
 
     loggedIn = state.loggedIn
     state.credentialStatus = loggedIn ? "[Connected]" : "[Disconnected]"
-    loggedIn
+    return loggedIn
 }
 
 def reAuth() {
-    if (!doLogin()) {
-        runIn(60 * state.loginAttempt * state.loginAttempt, reAuth) // timeout or other login issue occurred, attempt again with exponential backoff
-        getChildDevices().each {
-            it.parseUnitStatus(state.credentialStatus, null)
-            it.sendEvent(name: "robotStatusText", value: state.loginResponse)
-        }
-    }
+    // Do nothing but keep this for backwards compatibility
 }
 
 // Get the list of Litter-Robots
 def getLitterRobots() {
-    def data = doCallout("GET", "/litter-robots", null).data
+    def data = doApiGet("/users/${state.userId}/robots", null)
+
     // save in state so we can re-use in settings
     def robots = [:]
     data.each {
@@ -175,48 +170,26 @@ def getLitterRobots() {
     data
 }
 
-def doCallout(calloutMethod, urlPath, calloutBody) {
-    doCallout(calloutMethod, urlPath, calloutBody, null)
-}
-
-def doCallout(calloutMethod, urlPath, calloutBody, queryParams){
-    def isLoginRequest = urlPath == "/login"
-   
-    if (state.loggedIn || isLoginRequest) { // prevent unauthorized calls
-        log.info "\"${calloutMethod}\"-ing to \"${urlPath}\""
-    
-        def params = [
-            uri: "https://muvnkjeut7.execute-api.us-east-1.amazonaws.com",
-            path: "/staging/${isLoginRequest ? "" : (state.uri?.trim()?:"")}${urlPath}",
-            query: queryParams,
+def authApi(username, password) {
+    def params = [
+            uri: authHost,
+            path: "/oauth/token",
             headers: [
-                "Content-Type": "application/json",
-                "x-api-key": state.apiKey,
-                Authorization: state.token?.trim() ? "Bearer ${state.token as String}" : null
+                "Content-Type": "application/x-www-form-urlencoded"
             ],
-            body: calloutBody
+            body: [
+                client_id: clientId,
+                client_secret: clientSecret,
+                grant_type: "password",
+                username: username,
+                password: password
+            ]
         ]
-        
-        try {
+
+     try {
 			def result
-            switch (calloutMethod) {
-                case "GET":
-                    httpGet(params) {resp->
-                        result = resp
-                    }
-                    break
-                case "PATCH":
-                    params.headers["x-http-method-override"] = "PATCH"
-                    // NOTE: break is purposefully missing so that it falls into the next case and "POST"s
-                case "POST":
-                    httpPostJson(params) {resp->
-                        result = resp
-                    }
-                    break
-                default:
-                    log.error "unhandled method"
-                    result =  [error: "unhandled method"]
-                    break
+            httpPost(params) { resp->
+                result = resp
             }
 			return result
         } catch (groovyx.net.http.HttpResponseException e) {
@@ -226,11 +199,143 @@ def doCallout(calloutMethod, urlPath, calloutBody, queryParams){
             log.error "Something went wrong: ${e}"
             return [error: e.message]
         }
-    } else {
-        log.info "skipping request since the user is not currently logged in"
-        return []
-    }
 }
+
+def getUserId() {
+    state.userId = doApiGet("/users",null)?.user?.userId
+    log.debug state.userId
+}
+
+def reauthenticateIfNeeded(e) {
+    if (e.response.status == 401 || e.response.status == 403)
+        return doLogin()
+    return false
+}
+
+def doApiGet(path, query) {
+    if (state.token_expiration <= now()) {
+        doLogin()
+    }
+    
+    def result
+    def params = [
+        uri: apiHost,
+        path: path,
+        query: query,
+        headers: [
+            "Authorization": state.token,
+            "x-api-key": xApiKey
+        ]
+    ]
+    try
+    {
+        httpGet(params) { resp -> 
+            result = resp.data
+        }
+    } catch (groovyx.net.http.HttpResponseException e) {
+        if (reauthenticateIfNeeded(e)) {
+            try {
+                httpGet(params) { resp -> 
+                    result = resp.data
+                }
+            }
+            catch (err) {
+                log.error err
+                return null
+            }
+        }
+    }
+    catch (e) {
+        log.error e
+    }
+    return result
+}
+
+def doApiPatch(path, body) {
+    if (state.token_expiration <= now()) {
+        doLogin()
+    }
+
+    def result
+    def params = [
+        uri: apiHost,
+        path:path,
+        contentType: "application/json",
+        requestContentType: "application/json",
+        headers: [
+            "Content-Type": "application/json",
+            "Authorization": state.token,
+            "x-api-key": xApiKey
+        ],
+        body: body
+    ]
+    try
+    {
+        httpPatch(params) { resp -> 
+            result = resp.data
+        }
+    } catch (groovyx.net.http.HttpResponseException e) {
+        if (reauthenticateIfNeeded(e)) {
+            try {
+                httpPatch(params) { resp -> 
+                    result = resp.data
+                }
+            }
+            catch (err) {
+                log.error err
+                return null
+            }
+        }
+    }
+    catch (e) {
+        log.error e
+    }
+    return result
+}
+
+def doApiPost(path, body) {
+    if (state.token_expiration <= now()) {
+        doLogin()
+    }
+         
+    def result
+    def params = [
+        uri: apiHost,
+        path:path,
+        requestContentType: "application/json",
+        headers: [
+            "User-Agent": "Litter-Robot/1.3.4 (com.autopets.whisker.ios; build:59; iOS 14.4.1) Alamofire/4.9.0",
+            "Authorization": state.token,
+            "x-api-key": xApiKey
+        ],
+        body: body
+    ]
+    try {
+
+        httpPost(params) { resp -> 
+            result = resp.data
+        }
+    }
+    catch (groovyx.net.http.HttpResponseException e) {
+        if (reauthenticateIfNeeded(e)) {
+            try {
+                httpPost(params) { resp -> 
+                    result = resp.data
+                }
+            }
+            catch (err) {
+                log.error err
+                return null
+            }
+        }
+    }
+    catch (e) {
+        log.error e
+    }
+    return result   
+}
+
+
 
 def installed() {
     initialize()
@@ -241,39 +346,35 @@ def updated() {
     initialize()
 }
 
-def initialize() {
-    // Tokens expire every 24 hours. Schedule to reauthorize every day
-    if(state.loginDate?.trim()) schedule(parseStDate(state.loginDate), reAuth)
-
-    def delete = getChildDevices().findAll { !settings.robots?.contains(it.deviceNetworkId) }
-    delete.each {
-        deleteChildDevice(it.deviceNetworkId)
-    }
-    
-    def childDevices = []
-    settings.robots.each {deviceId ->
-        try {
-            def childDevice = getChildDevice(deviceId)
-            if(!childDevice) {
-                log.info "Adding device: ${state.robots[deviceId]} [${deviceId}]"
-                childDevice = addChildDevice("natekspencer", "Litter-Robot", deviceId, location.hubs[0]?.id, [label: state.robots[deviceId], completedSetup: true])
-            }
-            childDevices.add(childDevice)
-        } catch (e) {
-            log.error "Error creating device: ${e}"
-        }
-    }
-    
-    // set up polling only if we have child devices
-    if(childDevices.size() > 0) {
-        pollChildren()
-		
-        schedule("0 0/${pollingInterval} * * * ?", pollChildren)
-    } else unschedule(pollChildren)
+def initialize() {		
+    def delete = getChildDevices().findAll { !settings.robots?.contains(it.deviceNetworkId) }	
+    delete.each {	
+        deleteChildDevice(it.deviceNetworkId)	
+    }	
+    	
+    def childDevices = []	
+    settings.robots.each {deviceId ->	
+        try {	
+            def childDevice = getChildDevice(deviceId)	
+            if(!childDevice) {	
+                log.info "Adding device: ${state.robots[deviceId]} [${deviceId}]"	
+                childDevice = addChildDevice("natekspencer", "Litter-Robot", deviceId, location.hubs[0]?.id, [label: state.robots[deviceId], completedSetup: true])	
+            }	
+            childDevices.add(childDevice)	
+        } catch (e) {	
+            log.error "Error creating device: ${e}"	
+        }	
+    }	
+    	
+    // set up polling only if we have child devices	
+    if(childDevices.size() > 0) {	
+        pollChildren()	
+			
+        schedule("0 0/${pollingInterval} * * * ?", pollChildren)	
+    } else unschedule(pollChildren)	
 }
 
 def pollChildren() {
-    log.info "polling..."
     def devices = getChildDevices()
     if (devices.size() == 0) {
         log.info "no children to update: skipping polling"
@@ -290,19 +391,17 @@ def pollChildren() {
 }
 
 def dispatchCommand(litterRobotId, command) {
-    log.info "dispatch command ${command} for ${litterRobotId}"
-    def resp = doCallout("POST", "/litter-robots/${litterRobotId}/dispatch-commands", [command: command as String])
-    resp.data
+    def data = doApiPost("/users/${state.userId}/robots/${litterRobotId}/dispatch-commands", [litterRobotId: litterRobotId, command: command as String])
+    return data
 }
 
 def getActivity(litterRobotId, limit=10) {
-    def resp = doCallout("GET", "/litter-robots/${litterRobotId}/activity", null, [limit: limit])
-    resp.data.activities
+    def data = doApiGet("/users/${state.userId}/robots/${litterRobotId}/activity", [limit: limit])
+    return data.activities
 }
 
 def resetDrawerGauge(litterRobotId, params) {
-    def resp = doCallout("PATCH", "/litter-robots/${litterRobotId}", [litterRobotNickname: params.name, cycleCapacity: params.capacity, cycleCount: 0, cyclesAfterDrawerFull: 0])
-    resp.data
+    return doApiPatch("/users/${state.userId}/robots/${litterRobotId}", [litterRobotNickname: params.name, cycleCapacity: params.capacity, cycleCount: 0, cyclesAfterDrawerFull: 0])
 }
 
 def isoFormat() {
